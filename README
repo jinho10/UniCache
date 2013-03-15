@@ -1,0 +1,50 @@
+
+                           cachedriver 
+            a hypervisor-controlled memory and disk cache system
+
+Developer
+---------
+Jinho Hwang (hwang.jinho@gmail.com)
+http://home.gwu.edu/~jinho10
+The George Washington University
+
+What is it?
+-----------
+
+cachedriver is a hypervisor-controlled memory and disk cache system that 
+exposes the spare memory to applications so that it utilizes 
+all the memory left in the system for the future uses. 
+Also, disk supports the small memory to have more space to put application data. 
+
+For more information see https://github.com/jinho10/cachedriver
+
+Compile
+-------
+xen-4.1.2
+
+Supplementary Code
+------------------
+
+-. linux kernel
+In order to access hypervisor-controlled memory, we need modified linux kernel
+stored in https://github.com/jinho10/mortar.
+
+-. modified memcached
+applications can use memcached protocol using cmemcached
+stored in https://github.com/jinho10/mortar.
+
+Grub Setting
+--------------
+Add this:
+multiboot /boot/xen.gz mcd
+
+Running
+-------
+basic running refers to https://github.com/jinho10/mortar.
+
+external cache driver
+xen-4.1.2/tools/mcd/mcd <directory>
+
+Paper
+-----
+TBD

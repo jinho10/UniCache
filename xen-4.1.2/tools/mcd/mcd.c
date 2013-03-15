@@ -1,0 +1,583 @@
+/******************************************************************************
+ * tools/mcd/mcd.c
+ *
+ * Domain mortar. 
+ * Copyright (c) 2012 The George Washington University (Jinho Hwang)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#define _XOPEN_SOURCE	600
+
+#include <inttypes.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <time.h>
+#include <signal.h>
+#include <unistd.h>
+#include <xc_private.h>
+
+#include <xen/mcd.h>
+
+#include "bitops.h"
+#include "spinlock.h"
+#include "file_ops.h"
+#include "xc.h"
+
+#include "policy.h"
+#include "mcd.h"
+
+#define FILENAME_LEN    128
+#define BASE            "mcd"
+
+#define my_trace() printf("%s (%d) \n", __FUNCTION__, __LINE__)
+//#define my_trace()
+
+static char root[64];
+static int interrupted;
+static void close_handler(int sig)
+{
+    interrupted = sig;
+}
+
+static void *init_page(void)
+{
+    void *buffer;
+    int ret;
+
+    /* Allocated page memory */
+    ret = posix_memalign(&buffer, PAGE_SIZE, PAGE_SIZE);
+    if ( ret != 0 )
+        goto out_alloc;
+
+    /* Lock buffer in memory so it can't be paged out */
+    ret = mlock(buffer, PAGE_SIZE);
+    if ( ret != 0 )
+        goto out_lock;
+
+    return buffer;
+
+ out_init:
+    munlock(buffer, PAGE_SIZE);
+ out_lock:
+    free(buffer);
+ out_alloc:
+    return NULL;
+}
+
+static mcd_t *mcd_init(domid_t domain_id)
+{
+    mcd_t *paging;
+    xc_interface *xch;
+    xentoollog_logger *dbg = NULL;
+    char *p;
+    int rc;
+    int rport = 0;
+
+    if ( getenv("MCD_DEBUG") )
+        dbg = (xentoollog_logger *)xtl_createlogger_stdiostream(stderr, XTL_DEBUG, 0);
+    xch = xc_interface_open(dbg, NULL, 0);
+    if ( !xch )
+        goto err_iface;
+
+    DPRINTF("mcd init\n");
+
+    /* Allocate memory */
+    paging = malloc(sizeof(mcd_t));
+    memset(paging, 0, sizeof(mcd_t));
+
+    /* Open connection to xen */
+    paging->xc_handle = xch;
+
+    /* Set domain id */
+    paging->mcd_event.domain_id = domain_id;
+
+    /* Initialise shared page */
+    paging->mcd_event.shared_page = init_page();
+    if ( paging->mcd_event.shared_page == NULL )
+    {
+        ERROR("Error initialising shared page");
+        goto err;
+    }
+
+    /* Initialise ring page */
+    paging->mcd_event.ring_page = init_page();
+    if ( paging->mcd_event.ring_page == NULL )
+    {
+        ERROR("Error initialising ring page");
+        goto err;
+    }
+
+    /* Initialise ring */
+    SHARED_RING_INIT((mcd_event_sring_t *)paging->mcd_event.ring_page);
+    BACK_RING_INIT(&paging->mcd_event.back_ring,
+                   (mcd_event_sring_t *)paging->mcd_event.ring_page,
+                   PAGE_SIZE);
+
+    /* Initialise lock */
+    mcd_event_ring_lock_init(&paging->mcd_event);
+    
+    /* Initialise Xen */
+    rc = xc_mcd_event_enable(xch, paging->mcd_event.domain_id,
+                             paging->mcd_event.shared_page,
+                             paging->mcd_event.ring_page);
+    if ( rc != 0 )
+    {
+        switch ( errno ) {
+            case EBUSY:
+                ERROR("mcd is (or was) active on this domain");
+                break;
+            case ENODEV:
+                ERROR("EPT not supported for this guest");
+                break;
+            default:
+                ERROR("Error initialising shared page: %s", strerror(errno));
+                break;
+        }
+        goto err;
+    }
+
+    /* Open event channel */
+    paging->mcd_event.xce_handle = xc_evtchn_open(NULL, 0);
+    if ( paging->mcd_event.xce_handle == NULL )
+    {
+        ERROR("Failed to open event channel");
+        goto err;
+    }
+
+    /* Bind event notification */
+    memcpy(&rport, paging->mcd_event.shared_page->data, sizeof(int));
+    rc = xc_evtchn_bind_interdomain(paging->mcd_event.xce_handle,
+                                    paging->mcd_event.domain_id,
+                                    rport);
+                                    //paging->mcd_event.shared_page->port);
+    if ( rc < 0 )
+    {
+        ERROR("Failed to bind event channel");
+        goto err;
+    }
+    paging->mcd_event.port = rc;
+
+    return paging;
+
+ err:
+    if ( paging )
+    {
+        xc_interface_close(xch);
+        if ( paging->mcd_event.shared_page )
+        {
+            munlock(paging->mcd_event.shared_page, PAGE_SIZE);
+            free(paging->mcd_event.shared_page);
+        }
+
+        if ( paging->mcd_event.ring_page )
+        {
+            munlock(paging->mcd_event.ring_page, PAGE_SIZE);
+            free(paging->mcd_event.ring_page);
+        }
+
+        free(paging);
+    }
+
+ err_iface: 
+    return NULL;
+}
+
+static int mcd_teardown(mcd_t *paging)
+{
+    int rc;
+    xc_interface *xch;
+
+    if ( paging == NULL )
+        return 0;
+
+    xch = paging->xc_handle;
+    paging->xc_handle = NULL;
+    /* Tear down domain paging in Xen */
+    rc = xc_mcd_event_disable(xch, paging->mcd_event.domain_id);
+    if ( rc != 0 )
+    {
+        ERROR("Error tearing down domain paging in xen");
+    }
+
+    /* Unbind VIRQ */
+    rc = xc_evtchn_unbind(paging->mcd_event.xce_handle, paging->mcd_event.port);
+    if ( rc != 0 )
+    {
+        ERROR("Error unbinding event port");
+    }
+    paging->mcd_event.port = -1;
+
+    /* Close event channel */
+    rc = xc_evtchn_close(paging->mcd_event.xce_handle);
+    if ( rc != 0 )
+    {
+        ERROR("Error closing event channel");
+    }
+    paging->mcd_event.xce_handle = NULL;
+    
+    /* Close connection to Xen */
+    rc = xc_interface_close(xch);
+    if ( rc != 0 )
+    {
+        ERROR("Error closing connection to xen");
+    }
+
+    /* Delete All the Files */
+    del_dir(root);
+
+    return 0;
+
+ err:
+    return -1;
+}
+
+static int get_request(mcd_event_t *mcd_event, mcd_event_request_t *req)
+{
+    mcd_event_back_ring_t *back_ring;
+    RING_IDX req_cons;
+
+    mcd_event_ring_lock(mcd_event);
+
+    back_ring = &mcd_event->back_ring;
+    req_cons = back_ring->req_cons;
+
+    /* Copy request */
+    memcpy(req, RING_GET_REQUEST(back_ring, req_cons), sizeof(*req));
+    req_cons++;
+
+    /* Update ring */
+    back_ring->req_cons = req_cons;
+    back_ring->sring->req_event = req_cons + 1;
+
+    mcd_event_ring_unlock(mcd_event);
+
+    return 0;
+}
+
+static int put_response(mcd_event_t *mcd_event, mcd_event_response_t *rsp)
+{
+    mcd_event_back_ring_t *back_ring;
+    RING_IDX rsp_prod;
+
+    mcd_event_ring_lock(mcd_event);
+
+    back_ring = &mcd_event->back_ring;
+    rsp_prod = back_ring->rsp_prod_pvt;
+
+    /* Copy response */
+    memcpy(RING_GET_RESPONSE(back_ring, rsp_prod), rsp, sizeof(*rsp));
+    rsp_prod++;
+
+    /* Update ring */
+    back_ring->rsp_prod_pvt = rsp_prod;
+    RING_PUSH_RESPONSES(back_ring);
+
+    mcd_event_ring_unlock(mcd_event);
+
+    return 0;
+}
+
+static int mcd_resume_page(mcd_t *paging, mcd_event_response_t *rsp)
+{
+    int ret;
+
+    /* Put the page info on the ring */
+    ret = put_response(&paging->mcd_event, rsp);
+    if ( ret != 0 )
+        goto out;
+
+    // TODO hypercall to let xen know that this is ready for receiving another data
+    xc_mcd_event_resume(paging->xc_handle, 0);
+
+ out:
+    return ret;
+}
+
+void dump(char *data, unsigned int size)
+{
+    int i;
+    for(i = 0; i < size; i++) {
+        printf("%c ", data[i]);
+    }
+    printf("\n");
+}
+
+void printf_req_rsp(mcd_event_request_t *req)
+{
+    printf("type:%d, domain:%d, flags:%x, hash:%u, totsize:%d, cursize:%d, accsize:%d, fd:%d, mcd_data:%p\n", 
+        req->type, req->domain, req->flags, req->hash, req->totsize, req->cursize, req->accsize, req->fd, req->mcd_data);
+}
+
+int main(int argc, char *argv[])
+{
+    struct sigaction act;
+    domid_t domain_id;
+    mcd_t *paging;
+    mcd_event_request_t req;
+    mcd_event_response_t rsp;
+    int i;
+    int rc = -1;
+    int rc1;
+    xc_interface *xch;
+
+    int open_flags = O_CREAT | O_TRUNC | O_RDWR;
+    mode_t open_mode = S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR | S_IWGRP | S_IWOTH;
+
+    if ( argc != 2 )
+    {
+        fprintf(stderr, "Usage: %s <root directory> \n", argv[0]);
+        return -1;
+    }
+
+    domain_id = 0; // only control domain itself
+
+    /* Seed random-number generator */
+    srand(time(NULL));
+
+    /* Initialise domain paging */
+    paging = mcd_init(domain_id);
+    if ( paging == NULL )
+    {
+        fprintf(stderr, "Error initialising paging");
+        return 1;
+    }
+    xch = paging->xc_handle;
+
+    /* Root directory */
+    sprintf(root, "%s/%s", argv[1], BASE);
+    chk_dir_and_clean_create(root);
+
+    /* ensure that if we get a signal, we'll do cleanup, then exit */
+    act.sa_handler = close_handler;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    sigaction(SIGHUP,  &act, NULL);
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT,  &act, NULL);
+    sigaction(SIGALRM, &act, NULL);
+    sigaction(SIGKILL, &act, NULL);
+
+    /* Swap pages in and out */
+    while ( !interrupted )
+    {
+        /* Wait for Xen to signal that a page needs paged in */
+        // XXX this should have some performance issue... I need to fix this as VIRQ way...
+        // XXX first try 1 ms as the lowest value if there is performance issue
+
+        // now this supposed to receive event from xen
+        rc = xc_wait_for_event_or_timeout(xch, paging->mcd_event.xce_handle, 1);
+        if ( rc < -1 )
+        {
+            ERROR("Error getting event");
+            goto out;
+        }
+        else if ( rc != -1 )
+        {
+            DPRINTF("Got event from Xen\n");
+        }
+
+        while ( RING_HAS_UNCONSUMED_REQUESTS(&paging->mcd_event.back_ring) )
+        {
+
+            if ( (rc = get_request(&paging->mcd_event, &req)) ) {
+                ERROR("Error getting request");
+                goto out;
+            }
+
+            // TODO since I have create/destroy, I need to remove the following...
+            // XXX should be done by domain create and domain destroy.. to reduce time
+            {
+            char filename[FILENAME_LEN];
+            sprintf(filename, "%s/%u", root, req.domain);
+            chk_dir_and_create(filename);
+            }
+
+            // probably make two switch, one for pre and the other for post
+            // in order to consolidate the same operation
+            switch ( req.type ) {
+            case MCD_EVENT_OP_PUT:
+            {
+                int fd = 0;
+
+                if_set(req.flags, MCD_EVENT_OP_FLAGS_NEW) {
+                    char filename[FILENAME_LEN];
+
+                    cl_bit(req.flags, MCD_EVENT_OP_FLAGS_NEW);
+
+                    // XXX TODO needs to make directory for the dom...
+                    // domain dir check
+                    sprintf(filename, "%s/%u/%u", root, req.domain, req.hash);
+                    if ( (fd = open(filename, open_flags, open_mode)) < 0 ) {
+                        perror("failed to open file");
+                        st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); // let mcdctl know about this
+                        break;
+                    }
+                    req.fd = fd;
+                }
+
+                // Check whether this is success ... XXX make set error to abord due to some reason
+                rc = my_write(req.fd, paging->mcd_event.shared_page->data, req.cursize);
+                //printf("rc from my_write = %d \n", rc);
+
+                if_set(req.flags, MCD_EVENT_OP_FLAGS_FINAL) {
+                    //printf("this is final transfer \n");
+                    if ( req.fd ) { close(req.fd); req.fd = 0; }
+                }
+            } break;
+            case MCD_EVENT_OP_GET:
+            {
+                unsigned int left_size;
+                unsigned int start_byte; 
+                int fd = 0;
+
+                if_set(req.flags, MCD_EVENT_OP_FLAGS_NEW) {
+                    char filename[FILENAME_LEN];
+
+                    cl_bit(req.flags, MCD_EVENT_OP_FLAGS_NEW);
+
+                    // XXX TODO needs to make directory for the dom...
+                    sprintf(filename, "%s/%u/%u", root, req.domain, req.hash);
+                    if ( (fd = open(filename, open_flags, open_mode)) < 0 ) {
+                        perror("failed to open file");
+                        st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); // let mcdctl know about this
+                        break;
+                    }
+                    req.fd = fd;
+                }
+
+                left_size = req.totsize - req.accsize;
+                start_byte = (req.accsize == 0) ? 0 : (req.accsize+1);
+                if ( left_size >= PAGE_SIZE ) {
+                    find_and_read(req.fd, paging->mcd_event.shared_page->data, start_byte, PAGE_SIZE);
+                    req.cursize = PAGE_SIZE;
+
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_CONT);
+                    if ( left_size == PAGE_SIZE )
+                        st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
+
+                } else {
+                    find_and_read(req.fd, paging->mcd_event.shared_page->data, start_byte, left_size);
+                    req.cursize = left_size;
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
+                }
+
+                // XXX do we need backup system in case of error in xen??? maybe...
+                if_set(req.flags, MCD_EVENT_OP_FLAGS_FINAL) {
+                    char filename[FILENAME_LEN];
+
+                    if ( req.fd ) { close(req.fd); req.fd = 0; }
+                    sprintf(filename, "%s/%u/%u", root, req.domain, req.hash);
+                    del_file(filename);
+                }
+            } break;
+            case MCD_EVENT_OP_DEL:
+            {
+                char filename[FILENAME_LEN];
+                sprintf(filename, "%s/%u/%u", root, req.domain, req.hash);
+                if ( del_file(filename) != 0 ) {
+                    perror("failed to remove file");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
+            } break;
+            case MCD_EVENT_OP_DOM_CREATE:
+            {
+                char filename[FILENAME_LEN];
+                sprintf(filename, "%s/%u", root, req.domain);
+
+                if ( chk_dir_and_clean_create(filename) != 0 ) {
+                    perror("failed to make file");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
+            } break;
+            case MCD_EVENT_OP_DOM_FLUSH:
+            {
+                char filename[FILENAME_LEN];
+                sprintf(filename, "%s/%u", root, req.domain);
+
+                // jinho
+                if ( del_dir(filename) != 0 ) {
+                    perror("failed to del dir");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+
+                if ( chk_dir_and_create(filename) != 0 ) {
+                    perror("failed to create dir");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
+            } break;
+            case MCD_EVENT_OP_DOM_DESTROY:
+            {
+                char filename[FILENAME_LEN];
+                sprintf(filename, "%s/%u", root, req.domain);
+
+                if ( del_dir(filename) != 0 ) {
+                    perror("failed to remove file");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
+            } break;
+            case MCD_EVENT_OP_FLUSH_ALL:
+            {
+                char filename[FILENAME_LEN];
+                sprintf(filename, "%s", root);
+
+                if ( del_dir(filename) != 0 ) {
+                    perror("failed to remove directory");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                if ( chk_dir_and_create(filename) != 0 ) {
+                    perror("failed to create dir");
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_ERROR); 
+                }
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
+            } break;
+            default:
+            {
+                printf("error - type (%d) not exist", req.type);
+                continue;
+            } break;
+            }
+
+            //dump(paging->mcd_event.shared_page->data, req.cursize);
+
+            // Use request as response by changing the number
+            mcd_resume_page(paging, &req);
+        }
+    }
+    DPRINTF("mcd got signal %d\n", interrupted);
+
+ out:
+    /* Tear down domain paging */
+    rc1 = mcd_teardown(paging);
+    if ( rc1 != 0 )
+        fprintf(stderr, "Error tearing down paging");
+
+    if ( rc == 0 )
+        rc = rc1;
+    return rc;
+}
+
+/*
+ * Local variables:
+ * mode: C
+ * c-set-style: "BSD"
+ * c-basic-offset: 4
+ * indent-tabs-mode: nil
+ * End: 
+ */
