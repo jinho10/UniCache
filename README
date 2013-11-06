@@ -1,4 +1,4 @@
-                           cachedriver 
+                           mortar + cachedriver 
             a hypervisor-controlled memory and disk cache system
 
 Developer
@@ -18,7 +18,7 @@ exposes the spare memory to applications so that it utilizes
 all the memory left in the system for the future uses. 
 Also, disk supports the small memory to have more space to put application data. 
 
-For more information see https://github.com/jinho10/cachedriver
+For more information see https://github.com/jinho10/mortar-cachedriver
 
 Compile
 -------
