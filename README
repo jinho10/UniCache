@@ -1,4 +1,3 @@
-
                            cachedriver 
             a hypervisor-controlled memory and disk cache system
 
@@ -6,6 +5,9 @@ Developer
 ---------
 Jinho Hwang (hwang.jinho@gmail.com)
 http://home.gwu.edu/~jinho10
+
+Ahsen Uppal (ahsen.uppal@gmail.com)
+
 The George Washington University
 
 What is it?
@@ -56,6 +58,10 @@ sudo xl <commands>
  mcd-cache-mode      Set cache mode
  mcd-param           Set SSD Param
 
-Paper
------
-TBD
+Reading
+-------
+Jinho Hwang and Timothy Wood, “Mortar: Filling the Gaps in Data Center Memory,” Symposium on Cloud Computing (SOCC) Poster, 2013.
+
+Acknowledge
+-----------
+This project was supported in part by the National Science foundation.
