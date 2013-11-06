@@ -29,11 +29,11 @@ Supplementary Code
 
 -. linux kernel
 In order to access hypervisor-controlled memory, we need modified linux kernel
-stored in https://github.com/jinho10/mortar.
+stored in https://github.com/jinho10/old-mortar.
 
 -. modified memcached
 applications can use memcached protocol using cmemcached
-stored in https://github.com/jinho10/mortar.
+stored in https://github.com/jinho10/old-mortar.
 
 Grub Setting
 --------------
