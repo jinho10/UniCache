@@ -74,7 +74,9 @@ typedef struct mcd_hashT {
     spinlock_t lock;
 
     domid_t  domain;
-    uint16_t flags; /* TBD */
+#define MCD_HASHT_NORMAL        0
+#define MCD_HASHT_MEASUREMENT   1
+    uint16_t flags;
 #define MCD_MINF_ERROR      (1 << 0)
 
     uint32_t nr_pages;
@@ -114,6 +116,7 @@ typedef struct mcd_domain {
 
     /* In-memory data */
     uint32_t        nr_avail; // can be used, but we need policy
+    uint32_t        nr_keys;
     uint32_t        nr_used_pages;
     uint64_t        nr_used_bytes;
 
@@ -127,14 +130,18 @@ typedef struct mcd_domain {
     unsigned int    curr; // 0 - (over 100 is ok)
 
     // adaptive-dynamic partitioning
+    s_time_t        reset;
 #define HIT(_d) _d->get_succ++
     uint32_t        get_succ;
 #define MISS(_d) _d->get_fail++
     uint32_t        get_fail;
 #define HITRATE(_d) _d->hitrate
+#define MISSRATE(_d) (100 - _d->hitrate)
 #define SET_HITRATE(_d) _d->hitrate = (_d->get_succ * 100)/(_d->get_succ + _d->get_fail)
 #define RESET_HITRATE(_d) { _d->hitrate = 0; _d->get_succ = 0; _d->get_fail = 0; }
     uint32_t        hitrate; // hitrate = get_succ * 100 / (get_succ + get_fail)
+
+    uint32_t        rec_cost_avg; // average recovery cost
 } mcd_domain_t;
 
 /* 
@@ -228,6 +235,7 @@ void *mcd_malloc(uint64_t size, uint64_t align, domid_t domid);
  */
 int mcdctl_op(XEN_GUEST_HANDLE(xen_mcdctl_t) u_mcdctl);
 
+int get_num_shared_page(void);
 int minf_page_out(mcd_hashT_t *mh);
 int minf_page_in(mcd_hashT_t *mh);
 
@@ -236,6 +244,8 @@ int minf_page_dom_destroy(domid_t domid);
 int minf_page_del(domid_t domid, uint32_t hash);
 int minf_page_flush(void);
 int minf_page_dom_flush(domid_t domid);
+
+int increase_shared_page(unsigned int num);
 
 //#define MCDCTL_TESTING
 

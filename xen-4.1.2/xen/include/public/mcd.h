@@ -136,6 +136,7 @@ struct mcd_event_op {
 #define MCD_EVENT_OP_ENABLE     0
 #define MCD_EVENT_OP_RESUME     1
 #define MCD_EVENT_OP_DISABLE    2
+#define MCD_EVENT_OP_ADD_SHARED_PAGE 3
 
     uint32_t       mode;
 
@@ -194,6 +195,7 @@ typedef struct mcd_event_st {
 #define MCD_EVENT_OP_DOM_FLUSH      4
 #define MCD_EVENT_OP_DOM_DESTROY    5
 #define MCD_EVENT_OP_FLUSH_ALL      6
+#define MCD_EVENT_REQ_ADD_SHARED_PAGE 11
     domid_t  domain;
 
     uint32_t flags;

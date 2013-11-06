@@ -43,9 +43,10 @@ typedef struct mcd_event {
     xc_evtchn *xce_handle;
     int port;
     mcd_event_back_ring_t back_ring;
-    mcd_event_shared_page_t *shared_page;
-    /*int num_shared_page;*/
-    /*mcd_event_shared_page_t* shared_page[];*/
+    //mcd_event_shared_page_t *shared_page;
+    int num_shared_page;
+#define MAX_SHARED_PAGES    1280
+    mcd_event_shared_page_t* shared_page[MAX_SHARED_PAGES]; /* 1280*4096 = 5MB */
     void *ring_page;
     spinlock_t ring_lock;
 } mcd_event_t;

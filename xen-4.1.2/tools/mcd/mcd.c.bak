@@ -105,9 +105,8 @@ static mcd_t *mcd_init(domid_t domain_id)
     paging->mcd_event.domain_id = domain_id;
 
     /* Initialise shared page */
-    paging->mcd_event.num_shared_page = 1; // do not change this
-    paging->mcd_event.shared_page[0] = init_page();
-    if ( paging->mcd_event.shared_page[0] == NULL )
+    paging->mcd_event.shared_page = init_page();
+    if ( paging->mcd_event.shared_page == NULL )
     {
         ERROR("Error initialising shared page");
         goto err;
@@ -129,10 +128,10 @@ static mcd_t *mcd_init(domid_t domain_id)
 
     /* Initialise lock */
     mcd_event_ring_lock_init(&paging->mcd_event);
-
+    
     /* Initialise Xen */
     rc = xc_mcd_event_enable(xch, paging->mcd_event.domain_id,
-                             paging->mcd_event.shared_page[0],
+                             paging->mcd_event.shared_page,
                              paging->mcd_event.ring_page);
     if ( rc != 0 )
     {
@@ -159,7 +158,7 @@ static mcd_t *mcd_init(domid_t domain_id)
     }
 
     /* Bind event notification */
-    memcpy(&rport, paging->mcd_event.shared_page[0]->data, sizeof(int));
+    memcpy(&rport, paging->mcd_event.shared_page->data, sizeof(int));
     rc = xc_evtchn_bind_interdomain(paging->mcd_event.xce_handle,
                                     paging->mcd_event.domain_id,
                                     rport);
@@ -177,10 +176,10 @@ static mcd_t *mcd_init(domid_t domain_id)
     if ( paging )
     {
         xc_interface_close(xch);
-        if ( paging->mcd_event.shared_page[0] )
+        if ( paging->mcd_event.shared_page )
         {
-            munlock(paging->mcd_event.shared_page[0], PAGE_SIZE);
-            free(paging->mcd_event.shared_page[0]);
+            munlock(paging->mcd_event.shared_page, PAGE_SIZE);
+            free(paging->mcd_event.shared_page);
         }
 
         if ( paging->mcd_event.ring_page )
@@ -196,52 +195,14 @@ static mcd_t *mcd_init(domid_t domain_id)
     return NULL;
 }
 
-static int mcd_add_shared_page(mcd_t *p, unsigned int num)
+static int mcd_add_shared_page(unsigned int num)
 {
-    mcd_t *paging = p;
-    xc_interface *xch = paging->xc_handle;
-    unsigned int num_add = num;
-    unsigned int num_curr = paging->mcd_event.num_shared_page;
-    unsigned int i;
-    int rc = 0;
 
-    // not ready
-    if ( xch == NULL )
-        return -1;
-
-    // full complement
-    if ( paging->mcd_event.num_shared_page >= MAX_SHARED_PAGES )
-        return -1;
-
-    // size check
-    if ( num > (MAX_SHARED_PAGES - num_curr) )
-        num_add = (MAX_SHARED_PAGES - num_curr);
-
-    for ( i = num_curr; i < (num_curr + num_add); i++ ) {
-        paging->mcd_event.shared_page[i] = init_page();
-        if ( paging->mcd_event.shared_page[i] == NULL ) {
-            ERROR("Error init_page() shared page");
-            break; // stop here
-        }
-
-        rc = xc_mcd_event_add_shared_page(xch, paging->mcd_event.domain_id,
-                                          paging->mcd_event.shared_page[i]);
-
-        if ( rc != 0 )
-        {
-            ERROR("xc_mcd_event_add_shared_page returned %d ", rc);
-            break; // stop
-        }
-
-        paging->mcd_event.num_shared_page++;
-    }
-
-    return 0;
 }
 
 static int mcd_teardown(mcd_t *paging)
 {
-    int rc, i;
+    int rc;
     xc_interface *xch;
 
     if ( paging == NULL )
@@ -281,23 +242,6 @@ static int mcd_teardown(mcd_t *paging)
 
     /* Delete All the Files */
     del_dir(root);
-
-    /* Delete paging */
-    for ( i = 0; i < paging->mcd_event.num_shared_page; i++ ) {
-        if ( paging->mcd_event.shared_page[i] )
-        {
-            munlock(paging->mcd_event.shared_page[i], PAGE_SIZE);
-            free(paging->mcd_event.shared_page[i]);
-        }
-    }
-
-    if ( paging->mcd_event.ring_page )
-    {
-        munlock(paging->mcd_event.ring_page, PAGE_SIZE);
-        free(paging->mcd_event.ring_page);
-    }
-
-    free(paging);
 
     return 0;
 
@@ -452,7 +396,6 @@ int main(int argc, char *argv[])
 
         while ( RING_HAS_UNCONSUMED_REQUESTS(&paging->mcd_event.back_ring) )
         {
-            bool resume_need = true;
 
             if ( (rc = get_request(&paging->mcd_event, &req)) ) {
                 ERROR("Error getting request");
@@ -461,10 +404,10 @@ int main(int argc, char *argv[])
 
             // TODO since I have create/destroy, I need to remove the following...
             // XXX should be done by domain create and domain destroy.. to reduce time
-            if ( req.domain != 0 ) {
-                char filename[FILENAME_LEN];
-                sprintf(filename, "%s/%u", root, req.domain);
-                chk_dir_and_create(filename);
+            {
+            char filename[FILENAME_LEN];
+            sprintf(filename, "%s/%u", root, req.domain);
+            chk_dir_and_create(filename);
             }
 
             // probably make two switch, one for pre and the other for post
@@ -473,7 +416,6 @@ int main(int argc, char *argv[])
             case MCD_EVENT_OP_PUT:
             {
                 int fd = 0;
-                int num_page;
 
                 if_set(req.flags, MCD_EVENT_OP_FLAGS_NEW) {
                     char filename[FILENAME_LEN];
@@ -492,20 +434,7 @@ int main(int argc, char *argv[])
                 }
 
                 // Check whether this is success ... XXX make set error to abord due to some reason
-                for(num_page = 0; num_page < paging->mcd_event.num_shared_page; num_page++) 
-                {
-                    if ( req.cursize >= PAGE_SIZE ) {
-                        rc = my_write(req.fd, paging->mcd_event.shared_page[num_page]->data, PAGE_SIZE);
-                        req.cursize -= PAGE_SIZE;
-
-                        if ( req.cursize <= 0 )
-                            break;
-                    } else {
-                        rc = my_write(req.fd, paging->mcd_event.shared_page[num_page]->data, req.cursize);
-                        req.cursize -= req.cursize; // 0
-                        break;
-                    }
-                }
+                rc = my_write(req.fd, paging->mcd_event.shared_page->data, req.cursize);
                 //printf("rc from my_write = %d \n", rc);
 
                 if_set(req.flags, MCD_EVENT_OP_FLAGS_FINAL) {
@@ -518,7 +447,6 @@ int main(int argc, char *argv[])
                 unsigned int left_size;
                 unsigned int start_byte; 
                 int fd = 0;
-                int num_page;
 
                 if_set(req.flags, MCD_EVENT_OP_FLAGS_NEW) {
                     char filename[FILENAME_LEN];
@@ -537,28 +465,18 @@ int main(int argc, char *argv[])
 
                 left_size = req.totsize - req.accsize;
                 start_byte = (req.accsize == 0) ? 0 : (req.accsize+1);
-                req.cursize = 0;
+                if ( left_size >= PAGE_SIZE ) {
+                    find_and_read(req.fd, paging->mcd_event.shared_page->data, start_byte, PAGE_SIZE);
+                    req.cursize = PAGE_SIZE;
 
-                for(num_page = 0; num_page < paging->mcd_event.num_shared_page; num_page++)
-                {
-                    if ( left_size >= PAGE_SIZE ) {
-                        find_and_read(req.fd, paging->mcd_event.shared_page[num_page]->data, start_byte, PAGE_SIZE);
-                        req.cursize += PAGE_SIZE;
-                        start_byte += PAGE_SIZE;
-                        left_size -= PAGE_SIZE;
-
-                        st_bit(req.flags, MCD_EVENT_OP_FLAGS_CONT);
-                        if ( left_size <= 0 ) {
-                            st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
-                            break;
-                        }
-                    } else {
-                        find_and_read(req.fd, paging->mcd_event.shared_page[num_page]->data, start_byte, left_size);
-                        req.cursize += left_size;
-                        left_size -= left_size;
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_CONT);
+                    if ( left_size == PAGE_SIZE )
                         st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
-                        break;
-                    }
+
+                } else {
+                    find_and_read(req.fd, paging->mcd_event.shared_page->data, start_byte, left_size);
+                    req.cursize = left_size;
+                    st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
                 }
 
                 // XXX do we need backup system in case of error in xen??? maybe...
@@ -634,26 +552,17 @@ int main(int argc, char *argv[])
                 }
                 st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);
             } break;
-            case MCD_EVENT_REQ_ADD_SHARED_PAGE:
-            {
-                resume_need = false;
-                mcd_add_shared_page(paging, req.totsize);
-                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END); 
-            } break;
             default:
             {
                 printf("error - type (%d) not exist", req.type);
-
-                // end this req/rsp connection for safety
-                st_bit(req.flags, MCD_EVENT_OP_FLAGS_END);  
+                continue;
             } break;
             }
 
-            //dump(paging->mcd_event.shared_page[0]->data, req.cursize);
+            //dump(paging->mcd_event.shared_page->data, req.cursize);
 
             // Use request as response by changing the number
-            if ( resume_need )
-                mcd_resume_page(paging, &req);
+            mcd_resume_page(paging, &req);
         }
     }
     DPRINTF("mcd got signal %d\n", interrupted);

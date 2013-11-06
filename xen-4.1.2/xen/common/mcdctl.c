@@ -49,8 +49,12 @@ LOCAL int mcd_event_enable(struct domain *d, mfn_t ring_mfn, mfn_t shared_mfn)
     if ( d->mcd_event.ring_page == NULL )
         goto err;
 
-    d->mcd_event.shared_page = map_domain_page(mfn_x(shared_mfn));
-    if ( d->mcd_event.shared_page == NULL )
+//printk("domain_id = %d, ring_page = %p \n", d->domain_id, d->mcd_event.ring_page);
+
+    // default = 1
+    d->mcd_event.num_shared_page = 1;
+    d->mcd_event.shared_page[0] = map_domain_page(mfn_x(shared_mfn));
+    if ( d->mcd_event.shared_page[0] == NULL )
         goto err_ring;
 
     // TODO check this... whether we need this or just using ring for notification...
@@ -62,7 +66,7 @@ LOCAL int mcd_event_enable(struct domain *d, mfn_t ring_mfn, mfn_t shared_mfn)
         goto err_shared;
 
     // XXX since we use data as a buffer.. this is the way to avoid future conflict
-    memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page)->data, &rc, sizeof(int));
+    memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page[0])->data, &rc, sizeof(int));
     d->mcd_event.xen_port = rc;
 
     /* Prepare ring buffer */
@@ -70,7 +74,7 @@ LOCAL int mcd_event_enable(struct domain *d, mfn_t ring_mfn, mfn_t shared_mfn)
                     (mcd_event_sring_t *)d->mcd_event.ring_page,
                     PAGE_SIZE);
 
-printk("ring buffer size = %d \n", (&(d->mcd_event.front_ring))->nr_ents);
+//printk("ring buffer size = %d \n", (&(d->mcd_event.front_ring))->nr_ents);
 
     mcd_event_ring_lock_init(d);
 
@@ -82,8 +86,8 @@ printk("ring buffer size = %d \n", (&(d->mcd_event.front_ring))->nr_ents);
     return 0;
 
  err_shared:
-    unmap_domain_page(d->mcd_event.shared_page);
-    d->mcd_event.shared_page = NULL;
+    unmap_domain_page(d->mcd_event.shared_page[0]);
+    d->mcd_event.shared_page[0] = NULL;
  err_ring:
     unmap_domain_page(d->mcd_event.ring_page);
     d->mcd_event.ring_page = NULL;
@@ -93,13 +97,37 @@ printk("ring buffer size = %d \n", (&(d->mcd_event.front_ring))->nr_ents);
 
 LOCAL int mcd_event_disable(struct domain *d)
 {
+    int i;
+
     unmap_domain_page(d->mcd_event.ring_page);
     d->mcd_event.ring_page = NULL;
 
-    unmap_domain_page(d->mcd_event.shared_page);
-    d->mcd_event.shared_page = NULL;
+    for ( i = 0; i < d->mcd_event.num_shared_page; i++) {
+        unmap_domain_page(d->mcd_event.shared_page[i]);
+        d->mcd_event.shared_page[i] = NULL;
+    }
 
     exit_mcdctl();
+
+    return 0;
+}
+
+LOCAL int mcd_event_add_shared_page(struct domain *d, mfn_t shared_mfn)
+{
+    int curr_num = d->mcd_event.num_shared_page;
+
+    if ( curr_num < 0 || curr_num >=  MAX_SHARED_PAGES ) {
+        printk("curr_num(%d) is wrong..\n", curr_num);
+        return 1;
+    }
+
+    d->mcd_event.shared_page[curr_num] = map_domain_page(mfn_x(shared_mfn));
+    if ( d->mcd_event.shared_page[curr_num] == NULL ) {
+        printk("d->mcd_event.shared_page[%d] == NULL.....\n", curr_num);
+        return 1;
+    }
+
+    d->mcd_event.num_shared_page++;
 
     return 0;
 }
@@ -182,8 +210,16 @@ my_trace()
         goto final;
     }
 
+    // bypass
     if_set(rsp.flags, MCD_EVENT_OP_FLAGS_END) {
         goto end;
+    }
+
+    switch ( rsp.type ) {
+    case MCD_EVENT_OP_GET:
+        rc = mcdctl_page_in((mcd_hashT_t*)rsp.mcd_data, &rsp);
+        if ( rc != 0 ) goto final;
+        break;
     }
 
     // only here to notify mcd to continue
@@ -200,10 +236,6 @@ my_trace()
     switch ( rsp.type ) {
     case MCD_EVENT_OP_PUT:
         rc = mcdctl_page_out((mcd_hashT_t*)rsp.mcd_data, &rsp);
-        if ( rc != 0 ) goto final;
-        break;
-    case MCD_EVENT_OP_GET:
-        rc = mcdctl_page_in((mcd_hashT_t*)rsp.mcd_data, &rsp);
         if ( rc != 0 ) goto final;
         break;
     }
@@ -267,6 +299,7 @@ LOCAL int mcd_event_check_ring(struct domain *d)
     mcd_event_ring_lock(d);
 
     free_requests = RING_FREE_REQUESTS(&d->mcd_event.front_ring);
+
     if ( unlikely(free_requests < 2) )
     {
         gdprintk(XENLOG_INFO, "free request slots: %d\n", free_requests);
@@ -337,7 +370,7 @@ LOCAL int mcd_event_op(struct domain *d, mcd_event_op_t *mec, XEN_GUEST_HANDLE(v
         mfn_t ring_mfn;
         mfn_t shared_mfn;
 
-        /* Only one xenpaging at a time. If xenpaging crashed,
+        /* Only one mcd at a time. If mcd crashed,
             * the cache is in an undefined state and so is the guest
             */
         rc = -EBUSY;
@@ -389,6 +422,39 @@ LOCAL int mcd_event_op(struct domain *d, mcd_event_op_t *mec, XEN_GUEST_HANDLE(v
     {
         rc = mcd_event_disable(d);
         mcdctl_enabled = 0;
+    } break;
+
+    case MCD_EVENT_OP_ADD_SHARED_PAGE:
+    {
+        struct domain *dom_mcd_event = current->domain;
+        struct vcpu *v = current;
+        unsigned long shared_addr = mec->shared_addr;
+        l1_pgentry_t l1e;
+        unsigned long gfn;
+        p2m_type_t p2mt;
+        mfn_t shared_mfn;
+
+//printk("case domain_id = %d, ring_page = %p \n", d->domain_id, d->mcd_event.ring_page);
+
+        /* Only one mcd at a time. If mcd crashed,
+            * the cache is in an undefined state and so is the guest
+            */
+        rc = -EBUSY;
+        if ( ! d->mcd_event.ring_page )
+            break;
+
+        /* Get MFN of shared page */
+        guest_get_eff_l1e(v, shared_addr, &l1e);
+        gfn = l1e_get_pfn(l1e);
+        shared_mfn = gfn_to_mfn(p2m_get_hostp2m(dom_mcd_event), gfn, &p2mt);
+
+        rc = -EINVAL;
+        if ( unlikely(!mfn_valid(mfn_x(shared_mfn))) )
+            break;
+
+        rc = mcd_event_add_shared_page(d, shared_mfn);
+
+        printk("mcdctl - MCD_EVENT_OP_ADD_SHARED_PAGE rc = %d\n", rc);
     } break;
 
     default:
@@ -443,8 +509,7 @@ LOCAL int mcdctl_page_out(mcd_hashT_t *mh, mcd_event_request_t *rsp)
 {
     struct domain *d = get_domain_by_id(0);
     mcd_event_request_t req;
-
-my_trace()
+    int num_page;
 
     if ( mcd_event_check_ring(d) )
         return -1;
@@ -465,40 +530,48 @@ my_trace()
     req.mcd_data = (void*)mh;
     req.hash = mh->hash;
     req.totsize = (mh->key_size + mh->val_size);
+    req.cursize = 0;
 
-    if ( (req.totsize - req.accsize) > PAGE_SIZE ) {
+    for(num_page = 0; num_page < d->mcd_event.num_shared_page; num_page++) 
+    {
 
-        memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page)->data, (mh->key_val + req.accsize), PAGE_SIZE);
+//printk("mcdctl_page_out - num_page(%d/%d), req.totsize(%u), req.accsize(%u)\n", num_page, d->mcd_event.num_shared_page, req.totsize, req.accsize);
 
-        req.cursize = PAGE_SIZE;
+        if ( (req.totsize - req.accsize) > PAGE_SIZE ) {
 
-        // XXX think about the error happens in user size.. needs to be reliable
-        req.accsize += PAGE_SIZE; 
+            memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page[num_page])->data, (mh->key_val + req.accsize), PAGE_SIZE);
 
-        st_bit(req.flags, MCD_EVENT_OP_FLAGS_CONT);
+            req.cursize += PAGE_SIZE;
 
-        if ( (req.totsize - req.accsize) == 0 )
+            // XXX think about the error happens in user size.. needs to be reliable
+            req.accsize += PAGE_SIZE; 
+
+            st_bit(req.flags, MCD_EVENT_OP_FLAGS_CONT);
+
+            // this should not happen...
+            if ( (req.totsize - req.accsize) <= 0 ) {
+                st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
+                break;
+            }
+        } else { // last
+
+            memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page[num_page])->data, (mh->key_val + req.accsize), (req.totsize - req.accsize));
+
+            req.cursize += (req.totsize - req.accsize);
+            req.accsize += (req.totsize - req.accsize); // should be same as totsize
+
+            // debugging...
+            /*
+            if ( req.totsize != req.accsize )
+                printk("something is wrong in req/rsp management %d != %d \n", req.totsize, req.accsize);
+            */
+
             st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
-
-    } else {
-
-        memcpy(((mcd_event_shared_page_t *)d->mcd_event.shared_page)->data, (mh->key_val + req.accsize), (req.totsize - req.accsize));
-
-        req.cursize = req.totsize - req.accsize;
-        req.accsize += (req.totsize - req.accsize); // should be same as totsize
-
-        // debugging...
-        /*
-        if ( req.totsize != req.accsize )
-            printk("something is wrong in req/rsp management %d != %d \n", req.totsize, req.accsize);
-        */
-
-        st_bit(req.flags, MCD_EVENT_OP_FLAGS_FINAL);
+            break;
+        }
     }
 
     mcd_event_put_request(d, &req);
-
-my_trace()
 
     return 0;
 }
@@ -507,17 +580,24 @@ LOCAL int mcdctl_page_in(mcd_hashT_t *mh, mcd_event_request_t *rsp)
 {
     struct domain *d = get_domain_by_id(0);
     mcd_event_request_t req;
+    int num_page;
+
+my_trace()
 
     if ( mcd_event_check_ring(d) )
         return -1;
 
     memset(&req, 0, sizeof(mcd_event_request_t));
 
+my_trace()
+
     req.type = MCD_EVENT_OP_GET;
     req.domain = mh->domain;
     req.hash = mh->hash;
     req.totsize = (mh->key_size + mh->val_size);
     req.mcd_data = (void*)mh;
+
+my_trace()
 
     if ( rsp == NULL ) {
         // XXX let's not allocate here... should be done by mcd.c
@@ -530,15 +610,49 @@ LOCAL int mcdctl_page_in(mcd_hashT_t *mh, mcd_event_request_t *rsp)
         */
 
         st_bit(req.flags, MCD_EVENT_OP_FLAGS_NEW);
+        req.accsize = 0;
     } else {
 
-        memcpy((mh->key_val + rsp->accsize), ((mcd_event_shared_page_t *)d->mcd_event.shared_page)->data, rsp->cursize);
+        // should not happen...
+        if ( rsp->cursize == 0 )
+            return -1;
 
-        req.accsize += (rsp->accsize + rsp->cursize);
+        req.accsize = rsp->accsize;
+        req.cursize = rsp->cursize; // use this for rsp's len info.
+
+//printk("mcdctl_page_in - d->mcd_event.num_shared_page (%d)\n", d->mcd_event.num_shared_page);
+
+        for(num_page = 0; num_page < d->mcd_event.num_shared_page; num_page++)
+        {
+            if ( req.cursize >= PAGE_SIZE ) {
+                memcpy((mh->key_val + req.accsize), ((mcd_event_shared_page_t *)d->mcd_event.shared_page[num_page])->data, PAGE_SIZE);
+                req.accsize += PAGE_SIZE;
+                req.cursize -= PAGE_SIZE;
+
+                if ( req.cursize <= 0 )
+                    break;
+            } else {
+                memcpy((mh->key_val + req.accsize), ((mcd_event_shared_page_t *)d->mcd_event.shared_page[num_page])->data, req.cursize);
+                req.accsize += rsp->cursize;
+                req.cursize -= rsp->cursize;
+                break;
+            }
+//printk("mcdctl_page_in - num_page(%d), req.accsize(%u), req.cursize(%u)\n", num_page, req.accsize, req.cursize);
+        }
+
+        // this is end of page_in.. so do not send requests anymore
+        if_set(rsp->flags, MCD_EVENT_OP_FLAGS_FINAL) {
+            return 0;
+        }
+
         req.fd = rsp->fd;
     }
 
+my_trace()
+
     mcd_event_put_request(d, &req);
+
+my_trace()
 
     return 0;
 }
@@ -634,9 +748,41 @@ LOCAL int mcdctl_page_flush(void)
     return 0;
 }
 
+/*
+ * Shared page management
+ */
+// before someone should make decision, let's test whether it is really helpful
+int increase_shared_page(unsigned int num)
+{
+    struct domain *d = get_domain_by_id(0);
+    mcd_event_request_t req;
+
+    if ( mcd_event_check_ring(d) || num <= 0 || num >= MAX_SHARED_PAGES )
+        return -1;
+
+    memset(&req, 0, sizeof(mcd_event_request_t));
+
+    req.type = MCD_EVENT_REQ_ADD_SHARED_PAGE;
+    req.domain = 0;
+    req.hash = 0;
+    req.totsize = num; // target
+    req.mcd_data = NULL;
+
+    mcd_event_put_request(d, &req);
+
+    printk("try to add %u more shared pages \n", num);
+
+    return 0;
+}
+
 /* 
  * Interfaces to MCD core module
  */ 
+int get_num_shared_page(void) 
+{
+    return ((struct domain *)get_domain_by_id(0))->mcd_event.num_shared_page;
+}
+
 int minf_page_out(mcd_hashT_t *mh)
 {
     int rc = 0;

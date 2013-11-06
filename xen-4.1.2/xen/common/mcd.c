@@ -20,6 +20,7 @@
 
 // XXX this is only-testing purpose.. needs to be deleted..
 //#define MCD_OVERHEAD_TESTING
+#define MCD_QUERY_TIME_TESTING
 //#define WORKLOAD_STAT_TEST
 
 #define my_trace() printk("%s (%d) \n", __FUNCTION__, __LINE__);
@@ -64,6 +65,11 @@ ft_measure ftm[NUM_USERS];
 uint32_t ftm_cnt = 0;
 uint32_t print_cnt = 0;
 
+uint32_t reset_time = 60; // 1 min
+
+#define MOVE_TO_SSD         0
+#define DO_NOT_MOVE_TO_SSD  1
+
 /*------------------------------------------------------------------------------
  - Configuration Settings
  ------------------------------------------------------------------------------*/
@@ -80,7 +86,8 @@ uint64_t current_free_memory_bytes; // current system memory
 #define set_query_time(_mh, _ms, _m) \
     _mh->query_time_ms = _ms;\
     if ( _ms > sd._m.query_max )\
-        sd._m.query_max = _ms;
+        sd._m.query_max = _ms; \
+    P_REC_AVG_CAL(mcd_dom, _ms);
 
 #define set_val_size(_mh, _val, _m) \
     _mh->val_size = _val;\
@@ -92,6 +99,10 @@ uint64_t current_free_memory_bytes; // current system memory
 #define QUR(_mh, _m) (sd._m.beta * (10 - _mh->query_time_ms*10/sd._m.query_max))
 #define VAL(_mh, _m) ((100 - sd._m.alpha - sd._m.beta) * (_mh->val_size*10/sd._m.val_max))
 #define SCORE(_mh, _m) (LOC(_mh, _m) + QUR(_mh, _m) + VAL(_mh, _m))/1000
+
+// does ++dom->nr_keys happen after * calculation???
+#define P_REC_AVG_CAL(dom, nd) dom->rec_cost_avg = (dom->rec_cost_avg * dom->nr_keys + nd)/(++dom->nr_keys)
+#define P_REC_AVG(dom) (dom->rec_cost_avg)
 
 g_score_data_t sd;
 
@@ -120,11 +131,12 @@ int partition_mode = MCD_PARTITION_MODE_BE;
 LOCAL spinlock_t g_mcd_domain_list_lock; 
 LOCAL struct list_head g_mcd_domain_list;
 
-LOCAL spinlock_t g_mcd_shared_hash_lock;
 #ifdef MCD_LINEAR_PROBE
+LOCAL spinlock_t g_mcd_shared_hash_lock;
 LOCAL struct list_head g_mcd_shared_hash_list;
 #elif defined(MCD_HASH_CHAINING)
 #define MAX_LIST_HEAD   100
+LOCAL spinlock_t g_mcd_shared_hash_lock[MAX_LIST_HEAD];
 LOCAL struct list_head g_mcd_shared_hash_list[MAX_LIST_HEAD];
 #endif
 // TODO lock protection
@@ -300,13 +312,13 @@ uint32_t getHash (const char * data, int len)
 LOCAL uint64_t get_free_sys_mem(void)
 {
     int64_t free = (((uint64_t)avail_domheap_pages() * PAGE_SIZE) - RESIDUAL_BYTES);
-    return (free > 0) ? (uint64_t)free : 0;
+    return (free > 0LL) ? (uint64_t)free : 0ULL;
 }
 
 LOCAL uint64_t get_tot_mem_size(void)
 {
     uint64_t tot_bytes = (TOT_USED_BYTES() + get_free_sys_mem());
-    if ( max_mem_bytes == 0 )
+    if ( max_mem_bytes == 0ULL )
         return tot_bytes;
     return (tot_bytes <= max_mem_bytes) ? tot_bytes : max_mem_bytes;
 }
@@ -314,7 +326,7 @@ LOCAL uint64_t get_tot_mem_size(void)
 LOCAL uint64_t get_free_mem_size(void)
 {
     int64_t free_bytes = get_tot_mem_size() - TOT_USED_BYTES();
-    return (free_bytes <= 0) ? 0 : (uint64_t)free_bytes;
+    return (free_bytes <= 0LL) ? 0ULL : (uint64_t)free_bytes;
 }
 
 /*------------------------------------------------------------------------------
@@ -709,12 +721,13 @@ LOCAL uint64_t p_remove_hashT(mcd_domain_t *dom, mcd_hashT_t *mh, int flag)
 //        mspin_lock(&dom->lock);
         dom->nr_used_pages -= mh->nr_pages;
         dom->nr_used_bytes -= mh->nr_bytes;
+        dom->nr_keys --;
 //        mspin_unlock(&dom->lock);
     }
 
     bytes = mh->nr_bytes;
 
-    if ( flag == 0 ) 
+    if ( flag == MOVE_TO_SSD && mh->flags == MCD_HASHT_NORMAL )
         remove_hashT(mh);
     else 
         remove_hashT_wo_page_out(mh);
@@ -745,12 +758,13 @@ LOCAL uint64_t s_remove_hashT(mcd_hashT_t *mh, int flag)
 //        mspin_lock(&mcd_dom->lock);
         mcd_dom->nr_used_pages -= mh->nr_pages;
         mcd_dom->nr_used_bytes -= mh->nr_bytes;
+        mcd_dom->nr_keys --;
 //        mspin_unlock(&mcd_dom->lock);
     }
 
     bytes = mh->nr_bytes;
 
-    if ( flag == 0 )
+    if ( flag == MOVE_TO_SSD && mh->flags == MCD_HASHT_NORMAL )
         remove_hashT(mh);
     else 
         remove_hashT_wo_page_out(mh);
@@ -768,10 +782,11 @@ LOCAL int mcdc_stat_display(mcd_va_t buf, int off, uint32_t len, bool_t use_long
     char info[BSIZE];
     int n = 0, sum = 0;
 
-        n += scnprintf(info, BSIZE, "tot_bytes_used:%lu(%lu:%lu),tot_bytes_free:%lu,nr_keys:%u\n",
+        n += scnprintf(info, BSIZE, "shared_p:%d,tot_bytes_used:%lu(%lu:%lu),tot_bytes_free(%luM):%lu,nr_keys:%u\n",
+                                    get_num_shared_page(),
                                     TOT_USED_BYTES(), 
 				    mcd_data.pri_nr_bytes, mcd_data.shr_nr_bytes, 
-                                    get_free_mem_size(),
+                                    (max_mem_bytes/1000000), get_free_mem_size(),
                                     TOT_USED_KEYS());
 
     /*
@@ -976,8 +991,8 @@ LOCAL int mcdc_domain_header(mcd_domain_t *dom, mcd_va_t buf, int off, uint32_t 
     //n += scnprintf(info, BSIZE, "dom:%d,weight:%d,ratio:%d,avail:%d,used:%d,bytes:%ld,curr:%d,", 
     //            dom->domid, dom->weight, dom->ratio, dom->nr_avail, dom->nr_used_pages, dom->nr_used_bytes, dom->curr);
 
-    n += scnprintf(info, BSIZE, "dom:%d,weight:%d,ratio:%d,bytes:%ld,\n", 
-                dom->domid, dom->weight, dom->ratio, dom->nr_used_bytes);
+    n += scnprintf(info, BSIZE, "dom:%d,weight:%d,ratio:%d,bytes:%ld,missrate:%d(%u/%u)\n", 
+                dom->domid, dom->weight, dom->ratio, dom->nr_used_bytes, MISSRATE(dom), dom->get_succ, dom->get_fail);
 
     if ( sum + n >= len )
         return sum;
@@ -1115,6 +1130,11 @@ LOCAL mcd_hashT_t *create_mcd_hashT(domid_t domid, uint32_t key_size, uint32_t v
 
         mh->key_val = ((char*)mh) + sizeof(mcd_hashT_t); // TODO confirmed
 
+        if ( val_size == 0 )
+            mh->flags = MCD_HASHT_MEASUREMENT; // do not send out to ssd
+        else
+            mh->flags = MCD_HASHT_NORMAL;
+
         mspin_lock(&mcd_data.lock);
 
         if ( cache_mode == MCD_CACHE_MODE_SHARED ) {
@@ -1128,6 +1148,7 @@ LOCAL mcd_hashT_t *create_mcd_hashT(domid_t domid, uint32_t key_size, uint32_t v
 //            mspin_lock(&mcd_dom->lock);
             mcd_dom->nr_used_pages += mh->nr_pages;
             mcd_dom->nr_used_bytes += mh->nr_bytes;
+            mcd_dom->nr_keys ++;
 //            mspin_unlock(&mcd_dom->lock);
         } else {
             mcd_domain_t *mcd_dom = find_mcd_dom(domid);
@@ -1138,6 +1159,7 @@ LOCAL mcd_hashT_t *create_mcd_hashT(domid_t domid, uint32_t key_size, uint32_t v
 //            mspin_lock(&mcd_dom->lock);
             mcd_dom->nr_used_pages += mh->nr_pages;
             mcd_dom->nr_used_bytes += mh->nr_bytes;
+            mcd_dom->nr_keys ++;
 //            mspin_unlock(&mcd_dom->lock);
         }
         mspin_unlock(&mcd_data.lock);
@@ -1200,7 +1222,7 @@ LOCAL void dom_usage_update(mcd_domain_t *dom)
     }
 
     total = get_tot_mem_size();
-    if ( total == 0 ) { // impossible.. something is wrong
+    if ( total == 0ULL ) { // impossible.. something is wrong
         ratio = 0;
     } else {
         ratio = (uint32_t) ((dom->nr_used_bytes * 100ULL) / total);
@@ -1271,13 +1293,13 @@ LOCAL int shared_cache_free(uint64_t amount)
         mspin_lock(&g_mcd_shared_hash_lock);
         list_for_each_entry(curr, &g_mcd_shared_hash_list, hash_list) {
             if ( latedel != NULL ) { 
-                tot += s_remove_hashT(latedel, 0);
+                tot += s_remove_hashT(latedel, MOVE_TO_SSD);
                 //printk("shared freed = %d\n", tot);
                 latedel = NULL;
             }
 
             // TO Policy : TODO check time 
-            if ( (now - curr->put_time)/1000000000 > MCD_EXP_TIME ) {
+            if ( (now - curr->put_time)/1000000000ull > MCD_EXP_TIME ) {
                 latedel = curr;
                 continue;
             }
@@ -1302,20 +1324,19 @@ LOCAL int shared_cache_free(uint64_t amount)
 
 #elif defined(MCD_HASH_CHAINING)
 
-#define sremove(_p, _f) { tot += s_remove_hashT(_p, 0); _p = NULL; visited = 1; }
+#define sremove(_p, _f) { tot += s_remove_hashT(_p, MOVE_TO_SSD); _p = NULL; visited = 1; }
     switch ( replacement_mode ) {
     case MCD_REPLACE_MODE_LFRU:
     {
         while ( tot < amount ) {
             visited = 0;
-            //printk("[STR] tot(%lu) amount(%lu) \n", tot, amount);
             for(i = 0; i < MAX_LIST_HEAD; i++) {
                 struct list_head *hash = &g_mcd_shared_hash_list[i];
                 mcd_hashT_t *lru = NULL, *lfu = NULL;
                 maxtime = 0;
                 minref = (((uint32_t)~0ull>>1));
 
-                mspin_lock(&g_mcd_shared_hash_lock);
+                mspin_lock(&g_mcd_shared_hash_lock[i]);
                 list_for_each_entry(curr, hash, hash_list) {
                     /* TO Policy : TODO check time 
                     if ( (now - curr->put_time)/1000000000 > MCD_EXP_TIME ) {
@@ -1344,12 +1365,11 @@ LOCAL int shared_cache_free(uint64_t amount)
                 if ( lfu )
                     sremove(lfu, 0)
 
-                mspin_unlock(&g_mcd_shared_hash_lock);
+                mspin_unlock(&g_mcd_shared_hash_lock[i]);
 
                 if ( tot > amount )
                     break;
             }
-            //printk("[END] tot(%lu) amount(%lu) \n", tot, amount);
 
             // safety escape loop
             if ( visited == 0 )
@@ -1362,7 +1382,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 struct list_head *hash = &g_mcd_shared_hash_list[i];
                 latedel = NULL;
 
-                mspin_lock(&g_mcd_shared_hash_lock);
+                mspin_lock(&g_mcd_shared_hash_lock[i]);
                 list_for_each_entry(curr, hash, hash_list) {
                     if ( latedel != curr ) { 
                         sremove(latedel, 0)
@@ -1374,7 +1394,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 if ( latedel )
                     sremove(latedel, 0)
 
-                mspin_unlock(&g_mcd_shared_hash_lock);
+                mspin_unlock(&g_mcd_shared_hash_lock[i]);
 
                 if ( tot > amount ) 
                     break;
@@ -1389,7 +1409,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 struct list_head *hash = &g_mcd_shared_hash_list[i];
                 latedel = NULL;
 
-                mspin_lock(&g_mcd_shared_hash_lock);
+                mspin_lock(&g_mcd_shared_hash_lock[i]);
                 list_for_each_entry(curr, hash, hash_list) {
                     if ( latedel != curr ) { 
                         sremove(latedel, 0)
@@ -1400,7 +1420,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 }
                 if ( latedel )
                     sremove(latedel, 0)
-                mspin_unlock(&g_mcd_shared_hash_lock);
+                mspin_unlock(&g_mcd_shared_hash_lock[i]);
 
                 if ( tot > amount ) 
                     break;
@@ -1417,7 +1437,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 mcd_hashT_t *min_score = NULL;
                 minref = (((uint32_t)~0ull>>1));
 
-                mspin_lock(&g_mcd_shared_hash_lock);
+                mspin_lock(&g_mcd_shared_hash_lock[i]);
                 list_for_each_entry(curr, hash, hash_list) {
                     // min score
                     uint32_t score = SCORE(curr, mem);
@@ -1429,7 +1449,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 if ( min_score )
                     sremove(min_score, 0)
 
-                mspin_unlock(&g_mcd_shared_hash_lock);
+                mspin_unlock(&g_mcd_shared_hash_lock[i]);
 
                 if ( tot > amount )
                     break;
@@ -1447,7 +1467,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 struct list_head *hash = &g_mcd_shared_hash_list[i];
                 latedel = NULL;
 
-                mspin_lock(&g_mcd_shared_hash_lock);
+                mspin_lock(&g_mcd_shared_hash_lock[i]);
                 list_for_each_entry(curr, hash, hash_list) {
                     if ( latedel != curr ) { 
                         sremove(latedel, 0)
@@ -1459,7 +1479,7 @@ LOCAL int shared_cache_free(uint64_t amount)
                 if ( latedel )
                     sremove(latedel, 0)
 
-                mspin_unlock(&g_mcd_shared_hash_lock);
+                mspin_unlock(&g_mcd_shared_hash_lock[i]);
 
                 if ( tot > amount ) 
                     break;
@@ -1513,7 +1533,7 @@ my_trace()
             latedel = NULL;
             list_for_each_entry(curr, &dom->mcd_hash_list_head, hash_list) {
                 if ( latedel != NULL ) { 
-                    premove(dom, latedel, 0)
+                    premove(dom, latedel, MOVE_TO_SSD)
                     if ( tot > amount ) 
                         return -ERR_NO;
                 }
@@ -1521,7 +1541,7 @@ my_trace()
             }
 
             if ( latedel != NULL ) {
-                premove(dom, latedel, 0)
+                premove(dom, latedel, MOVE_TO_SSD)
                 if ( tot > amount )
                     return -ERR_NO;
             }
@@ -1567,10 +1587,10 @@ if ( (now - curr->put_time)/1000000000 > MCD_EXP_TIME ) {
             }                                                                  \
             if ( lru != lfu ) {                                                \
                 if ( lru )                                                     \
-                    premove(dom, lru, 0)                                       \
+                    premove(dom, lru, MOVE_TO_SSD)                             \
             }                                                                  \
             if ( lfu )                                                         \
-                premove(dom, lfu, 0)                                           \
+                premove(dom, lfu, MOVE_TO_SSD)                                 \
             mspin_unlock(&dom->lock);                                          \
         } break;                                                               \
         case MCD_REPLACE_MODE_FAST:                                            \
@@ -1579,11 +1599,11 @@ if ( (now - curr->put_time)/1000000000 > MCD_EXP_TIME ) {
             mspin_lock(&dom->lock);                                            \
             list_for_each_entry(curr, &dom->mcd_hash_list_head, hash_list) {   \
                 if ( latedel )                                                 \
-                    premove(dom, latedel, 0)                                   \
+                    premove(dom, latedel, MOVE_TO_SSD)                         \
                 latedel = curr;                                                \
             }                                                                  \
             if ( latedel )                                                     \
-                premove(dom, latedel, 0)                                       \
+                premove(dom, latedel, MOVE_TO_SSD)                             \
             mspin_unlock(&dom->lock);                                          \
         } break;                                                               \
         case MCD_REPLACE_MODE_SCORE:                                           \
@@ -1598,12 +1618,12 @@ if ( (now - curr->put_time)/1000000000 > MCD_EXP_TIME ) {
                 }                                                              \
             }                                                                  \
             if ( min_score )                                                   \
-                premove(dom, min_score, 0)                                     \
+                premove(dom, min_score, MOVE_TO_SSD)                           \
             mspin_unlock(&dom->lock);                                          \
         } break;                                                               \
         }
 
-my_trace()
+//my_trace()
     // Find others first for fair share
     if ( tot < amount ) {
         while ( tot <  amount ) {
@@ -1622,7 +1642,7 @@ my_trace()
         }
     }
 
-my_trace()
+//my_trace()
 
     // self when > 100
     if ( tot < amount ) {
@@ -1641,7 +1661,7 @@ my_trace()
             visited = 0;
         }
     }
-my_trace()
+//my_trace()
 
     // Others check when > 100
     if ( tot < amount ) {
@@ -1660,7 +1680,7 @@ my_trace()
             visited = 0;
         }
     }
-my_trace()
+//my_trace()
 
     // Self release
     if ( tot < amount ) {
@@ -1679,7 +1699,7 @@ my_trace()
             visited = 0;
         }
     }
-my_trace()
+//my_trace()
 
     // Self brutally release
     if ( tot < amount && replacement_mode == MCD_REPLACE_MODE_LFRU ) {
@@ -1691,17 +1711,17 @@ my_trace()
                 latedel = NULL;
                 list_for_each_entry(curr, &dom->mcd_hash_list_head, hash_list) {
                     if ( latedel )
-                        premove(dom, latedel, 0)
+                        premove(dom, latedel, MOVE_TO_SSD)
                     latedel = curr;
                 }
                 if ( latedel )
-                    premove(dom, latedel, 0)
+                    premove(dom, latedel, MOVE_TO_SSD)
                 if ( tot > amount ) 
                     break;
             }
         }
     }
-my_trace()
+//my_trace()
 
     if ( tot < amount ) 
         return -ERR_NOTMEM;
@@ -1709,6 +1729,10 @@ my_trace()
     return -ERR_NO;
 }
 
+/*
+ * This tries to maximize overall performance
+ * by maximizing the performance of the worst performed application
+ */
 LOCAL int partition_cf_adaptive_dynamic(uint64_t amount, domid_t domid)
 {
     s_time_t now = NOW();
@@ -1725,19 +1749,46 @@ LOCAL int partition_cf_adaptive_dynamic(uint64_t amount, domid_t domid)
     mcd_hashT_t *lru = NULL, *lfu = NULL;
 
     mcd_domain_t *hr_dom = NULL;
-    uint32_t hr_val = 0;
+    uint32_t hr_val = ~(0x00000000);
+    uint32_t max_rec_cost = 1; // just in case
+    uint32_t cost;
 
 //printk("[STR] adaptive_dynamic, amount(%lu), tot(%lu)\n", amount, tot);
 
     // XXX XXX I need to make this more adaptable 
     // when hr_dom has no data, I need to find another dom to free up the memory
 
+// TODO I have two parameters... [0, 100]
+#define COST(dom,max) ((MISSRATE(dom) * (P_REC_AVG(dom)*100)/max)/100)
+
+    // find the largest recovery average cost
     list_for_each_entry(dom, &g_mcd_domain_list, mcd_list) {
-//printk("dom(%u), hit(%u)\n", dom->domid, HITRATE(dom));
-        if ( HITRATE(dom) > hr_val ) {
-            hr_val = HITRATE(dom);
+//printk("dom(%u), P_REC_AVG(%u) \n", dom->domid, P_REC_AVG(dom));
+        if ( P_REC_AVG(dom) > max_rec_cost ) {
+            max_rec_cost = P_REC_AVG(dom);
+        }
+    }
+
+//printk("found the largest recovery average: %d\n", max_rec_cost);
+
+    // find the minimum cost
+    // can be himself
+    list_for_each_entry(dom, &g_mcd_domain_list, mcd_list) {
+        cost = COST(dom, max_rec_cost); 
+
+// debugging...
+//printk("max_rec_cost(%u), dom(%u), cost(%u), hr_val(%u)\n", max_rec_cost, dom->domid, cost, hr_val);
+
+        if ( cost < hr_val ) {
+            hr_val = cost;
             hr_dom = dom;
         }
+    }
+
+    if ( hr_dom == NULL ) {
+        //printk("%s domain is not found...\n", __FUNCTION__);
+        //return -ERR_NOEXIST;
+        hr_dom = find_mcd_dom(domid);
     }
 
     dom = hr_dom;
@@ -1852,6 +1903,7 @@ LOCAL int p_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
     char key[op->key_size];
     uint32_t hash;
     int error = -ERR_NOEXIST;
+    int rc = -ERR_NO;
 
     copy_from_guest(key, guest_handle_cast(op->key, void), op->key_size);
     hash = getHash(key, op->key_size);
@@ -1865,11 +1917,14 @@ LOCAL int p_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             copy_to_guest(guest_handle_cast(op->r_val_size, void), &error, sizeof(uint32_t));
         } else {
             copy_to_guest(guest_handle_cast(op->r_val_size, void), &mch->val_size, sizeof(uint32_t));
+            rc = RET_GET_SSD;
         }
     } else {
         copy_to_guest(guest_handle_cast(op->r_val_size, void), &mh->val_size, sizeof(uint32_t));
+        rc = RET_GET_MEM;
     }
 
+#ifdef MCD_QUERY_TIME_TESTING
     // XXX jinho - checking get and put time difference..
     if ( mh == NULL ) {
         mh = create_mcd_hashT(mcd_dom->domid, op->key_size, 0); // header only
@@ -1887,8 +1942,9 @@ LOCAL int p_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
 
         //copy_to_guest(guest_handle_cast(op->r_val_size, void), &error, sizeof(uint32_t));
     }
+#endif
 
-    return -ERR_NO;
+    return rc;
 }
 
 LOCAL int p_mcd_remove(mcd_domain_t *mcd_dom, mcd_arg_t *op)
@@ -1914,7 +1970,7 @@ LOCAL int p_mcd_remove(mcd_domain_t *mcd_dom, mcd_arg_t *op)
         }
     } else {
         mspin_lock(&mcd_dom->lock);
-        p_remove_hashT(mcd_dom, mh, 1);
+        p_remove_hashT(mcd_dom, mh, DO_NOT_MOVE_TO_SSD);
         mspin_unlock(&mcd_dom->lock);
     }
 
@@ -1943,7 +1999,7 @@ LOCAL int p_mcd_put(mcd_domain_t *mcd_dom, mcd_arg_t *op)
         query_time_ms = time_diff_ms;
 
         mspin_lock(&mcd_dom->lock);
-        p_remove_hashT(mcd_dom, mh, 0);
+        p_remove_hashT(mcd_dom, mh, MOVE_TO_SSD);
         mspin_unlock(&mcd_dom->lock);
     } else {
         mch = find_mcdctl_hashT(MCDOPT_private, &mcd_dom->mcdctl_hash_list_head, hash);
@@ -1962,6 +2018,8 @@ LOCAL int p_mcd_put(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             return -ERR_MCDFAULT;
 
         set_query_time(mh, query_time_ms, mem)
+
+//printk("query_time = %u\n", query_time_ms);
 
         mspin_lock(&mcd_dom->lock);
         list_add_tail(&mh->hash_list, &mcd_dom->mcd_hash_list_head);
@@ -2032,11 +2090,11 @@ LOCAL int p_mcd_flush(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             prev = mh;
             continue;
         }
-        p_remove_hashT(mcd_dom, prev, 1);
+        p_remove_hashT(mcd_dom, prev, DO_NOT_MOVE_TO_SSD);
         prev = mh;
     }
     if ( prev != NULL )  // last item
-        p_remove_hashT(mcd_dom, prev, 1);
+        p_remove_hashT(mcd_dom, prev, DO_NOT_MOVE_TO_SSD);
 
     INIT_LIST_HEAD(&mcd_dom->mcd_hash_list_head);
 
@@ -2058,6 +2116,7 @@ LOCAL int s_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
     char key[op->key_size];
     uint32_t hash;
     uint32_t error = -ERR_NOEXIST;
+    int rc = -ERR_NO;
 
     copy_from_guest(key, guest_handle_cast(op->key, void), op->key_size);
     hash = getHash(key, op->key_size);
@@ -2077,11 +2136,14 @@ LOCAL int s_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             copy_to_guest(guest_handle_cast(op->r_val_size, void), &error, sizeof(uint32_t));
         } else {
             copy_to_guest(guest_handle_cast(op->r_val_size, void), &mch->val_size, sizeof(uint32_t));
+            rc = RET_GET_SSD;
         }
     } else {
         copy_to_guest(guest_handle_cast(op->r_val_size, void), &mh->val_size, sizeof(uint32_t));
+        rc = RET_GET_MEM;
     }
 
+#ifdef MCD_QUERY_TIME_TESTING
     // XXX jinho - checking get and put time difference..
     if ( mh == NULL ) {
         mh = create_mcd_hashT(mcd_dom->domid, op->key_size, 0); // header only
@@ -2092,19 +2154,22 @@ LOCAL int s_mcd_check(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             mh->hash = hash;
             copy_from_guest(mh->key_val, guest_handle_cast(op->key, void), op->key_size);
 
-            mspin_lock(&g_mcd_shared_hash_lock);
 #ifdef MCD_LINEAR_PROBE
+            mspin_lock(&g_mcd_shared_hash_lock);
             list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list);
-#elif defined(MCD_HASH_CHAINING)
-            list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
-#endif
             mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+            mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+            list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
+            mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
         } else {
 //printk("check mcd added failed......hash = %u \n", hash);
         }
 
         //copy_to_guest(guest_handle_cast(op->r_val_size, void), &error, sizeof(uint32_t));
     }
+#endif
 
     return -ERR_NO;
 }
@@ -2122,15 +2187,16 @@ LOCAL int s_mcd_put(mcd_domain_t *mcd_dom, mcd_arg_t *op)
 
 //printk("s_mcd_put... key %s, hash = %u, key_size = %u, val_size = %u \n", hash, op->key_size, op_val_size);
 
-    mspin_lock(&g_mcd_shared_hash_lock);
 
 #ifdef MCD_LINEAR_PROBE
+    mspin_lock(&g_mcd_shared_hash_lock);
     mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list, hash, key, op->key_size);
-#elif defined(MCD_HASH_CHAINING)
-    mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD], hash, key, op->key_size);
-#endif
-
     mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+    mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+    mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD], hash, key, op->key_size);
+    mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
 
     // XXX - jinho statistics ... checking get and put time difference...
     if ( mh != NULL ) {
@@ -2145,16 +2211,22 @@ LOCAL int s_mcd_put(mcd_domain_t *mcd_dom, mcd_arg_t *op)
         if ( time_diff_ns < min_get_put_time )
             min_get_put_time = time_diff_ns;
 
-//printk("mh != NULL... hash = %u, time = %u ms \n", hash, time_diff_ms);
+//printk("------ mh != NULL... hash = %u, time = %u ms \n", hash, time_diff_ms);
 
         if ( time_diff_ms >= MAX_QUERY_TIME )
             query_time[MAX_QUERY_TIME - 1]++;
         else 
             query_time[time_diff_ms]++;
 
+#ifdef MCD_LINEAR_PROBE
         mspin_lock(&g_mcd_shared_hash_lock);
-        s_remove_hashT(mh, 1);
+        s_remove_hashT(mh, DO_NOT_MOVE_TO_SSD);
         mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+        mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+        s_remove_hashT(mh, DO_NOT_MOVE_TO_SSD);
+        mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
     } else {
 
 //printk("mh == NULL... hash = %u \n", hash);
@@ -2192,22 +2264,24 @@ LOCAL int s_mcd_put(mcd_domain_t *mcd_dom, mcd_arg_t *op)
 
         set_query_time(mh, query_time_ms, mem)
 
-        mspin_lock(&g_mcd_shared_hash_lock);
 #ifdef MCD_LINEAR_PROBE
+        mspin_lock(&g_mcd_shared_hash_lock);
         list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list);
-#elif defined(MCD_HASH_CHAINING)
-        list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
-#endif
         mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+        mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+        list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
+        mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
 //    }
 
     copy_to_guest(guest_handle_cast(op->r_val_size, void), &mh->val_size, sizeof(uint32_t));
 
 #ifdef MCD_OVERHEAD_TESTING
     if ( mcdctl_enabled ) {
-        mspin_lock(&g_mcd_shared_hash_lock);
-        s_remove_hashT(mh, 0); // do page_out
-        mspin_unlock(&g_mcd_shared_hash_lock);
+        mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+        s_remove_hashT(mh, MOVE_TO_SSD); // do page_out
+        mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
     }
 #endif
 
@@ -2227,15 +2301,15 @@ LOCAL int s_mcd_get(mcd_domain_t *mcd_dom, mcd_arg_t *op)
 
 //printk("s_mcd_get... hash = %u \n", hash);
 
-    //mspin_lock(&g_mcd_shared_hash_lock);
-
 #ifdef MCD_LINEAR_PROBE
+    mspin_lock(&g_mcd_shared_hash_lock);
     mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list, hash, key, op->key_size);
+    mspin_unlock(&g_mcd_shared_hash_lock);
 #elif defined(MCD_HASH_CHAINING)
+    mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
     mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD], hash, key, op->key_size);
+    mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
 #endif
-
-    //mspin_unlock(&g_mcd_shared_hash_lock);
 
     if ( mh == NULL ) {
         mch = find_mcdctl_hashT(MCDOPT_shared, &g_mcdctl_shared_hash_list[hash % MAX_LIST_HEAD], hash);
@@ -2246,13 +2320,15 @@ LOCAL int s_mcd_get(mcd_domain_t *mcd_dom, mcd_arg_t *op)
         }
 
 	if ( mh != NULL ) {
-            mspin_lock(&g_mcd_shared_hash_lock);
             #ifdef MCD_LINEAR_PROBE
+            mspin_lock(&g_mcd_shared_hash_lock);
             list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list);
-            #elif defined(MCD_HASH_CHAINING)
-            list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
-            #endif
             mspin_unlock(&g_mcd_shared_hash_lock);
+            #elif defined(MCD_HASH_CHAINING)
+            mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+            list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
+            mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+            #endif
 	}
     } else {
         rc = RET_GET_MEM;
@@ -2307,17 +2383,17 @@ LOCAL int s_mcd_get(mcd_domain_t *mcd_dom, mcd_arg_t *op)
 
 #ifdef MCD_OVERHEAD_TESTING
     if ( mcdctl_enabled ) {
-        mspin_lock(&g_mcd_shared_hash_lock);
 #ifdef MCD_LINEAR_PROBE
+        mspin_lock(&g_mcd_shared_hash_lock);
         list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list);
-#elif defined(MCD_HASH_CHAINING)
-        list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
-#endif
-
-        s_remove_hashT(mh, 0); // should page out again..
-
+        s_remove_hashT(mh, MOVE_TO_SSD); // should page out again..
         mspin_unlock(&g_mcd_shared_hash_lock);
-
+#elif defined(MCD_HASH_CHAINING)
+        mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+        list_add_tail(&mh->hash_list, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD]);
+        s_remove_hashT(mh, MOVE_TO_SSD); // should page out again..
+        mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
     }
 #endif
 
@@ -2334,15 +2410,16 @@ LOCAL int s_mcd_remove(mcd_domain_t *mcd_dom, mcd_arg_t *op)
     copy_from_guest(key, guest_handle_cast(op->key, void), op->key_size);
     hash = getHash(key, op->key_size);
 
-    mspin_lock(&g_mcd_shared_hash_lock);
 
 #ifdef MCD_LINEAR_PROBE
+    mspin_lock(&g_mcd_shared_hash_lock);
     mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list, hash, key, op->key_size);
-#elif defined(MCD_HASH_CHAINING)
-    mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD], hash, key, op->key_size);
-#endif
-
     mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+    mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+    mh = find_mcd_hashT(MCDOPT_shared, &g_mcd_shared_hash_list[hash % MAX_LIST_HEAD], hash, key, op->key_size);
+    mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
 
     if ( mh == NULL ) {
         mch = find_mcdctl_hashT(MCDOPT_shared, &g_mcdctl_shared_hash_list[hash % MAX_LIST_HEAD], hash);
@@ -2354,9 +2431,15 @@ LOCAL int s_mcd_remove(mcd_domain_t *mcd_dom, mcd_arg_t *op)
             mspin_unlock(&g_mcdctl_shared_hash_lock);
         }
     } else {
+#ifdef MCD_LINEAR_PROBE
         mspin_lock(&g_mcd_shared_hash_lock);
-        s_remove_hashT(mh, 1);
+        s_remove_hashT(mh, DO_NOT_MOVE_TO_SSD);
         mspin_unlock(&g_mcd_shared_hash_lock);
+#elif defined(MCD_HASH_CHAINING)
+        mspin_lock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+        s_remove_hashT(mh, DO_NOT_MOVE_TO_SSD);
+        mspin_unlock(&g_mcd_shared_hash_lock[hash % MAX_LIST_HEAD]);
+#endif
     }
 
     return -ERR_NO;
@@ -2373,14 +2456,14 @@ LOCAL int s_mcd_flush(mcd_domain_t *mcd_dom, mcd_arg_t *op)
     mspin_lock(&g_mcd_shared_hash_lock);
     list_for_each_entry(mh, &g_mcd_shared_hash_list, hash_list) {
         if ( prev != NULL ) {
-            s_remove_hashT(prev, 1);
+            s_remove_hashT(prev, DO_NOT_MOVE_TO_SSD);
             prev = NULL;
         }
         prev = mh;
     }
 
     if ( prev != NULL ) // last item
-        s_remove_hashT(prev);
+        s_remove_hashT(prev, DO_NOT_MOVE_TO_SSD);
 
     mspin_unlock(&g_mcd_shared_hash_lock);
 
@@ -2393,23 +2476,23 @@ LOCAL int s_mcd_flush(mcd_domain_t *mcd_dom, mcd_arg_t *op)
         struct list_head *hash_list = &g_mcd_shared_hash_list[i];
         
         prev = NULL;
-        mspin_lock(&g_mcd_shared_hash_lock);
+        mspin_lock(&g_mcd_shared_hash_lock[i]);
         list_for_each_entry(mh, hash_list, hash_list) {
             if ( prev == NULL ) { // first item
                 prev = mh;
                 continue;
             }
-            s_remove_hashT(prev, 1);
+            s_remove_hashT(prev, DO_NOT_MOVE_TO_SSD);
             prev = mh;
         }
 
         if ( prev != NULL ) // last item
-            s_remove_hashT(prev, 1);
+            s_remove_hashT(prev, DO_NOT_MOVE_TO_SSD);
 
         // reinitialize
         INIT_LIST_HEAD(&g_mcd_shared_hash_list[i]);
 
-        mspin_unlock(&g_mcd_shared_hash_lock);
+        mspin_unlock(&g_mcd_shared_hash_lock[i]);
     }
 #endif
 
@@ -2453,6 +2536,21 @@ LOCAL void p_mcd_flush_all(void)
 
     // just clear unnecessary data here
     exit_mcdctl();
+}
+
+LOCAL void mcd_dom_params_reset(void)
+{
+    mcd_domain_t *dom;
+
+    list_for_each_entry(dom, &g_mcd_domain_list, mcd_list) {
+        if ( dom->domid == 0 ) 
+            continue;
+
+        dom->reset = NOW();
+        dom->get_succ = 0;
+        dom->get_fail = 0;
+        dom->hitrate = 0;
+    }
 }
 
 LOCAL inline mcd_domain_t *mcd_domain_from_domid(domid_t did)
@@ -2543,20 +2641,23 @@ LOCAL int display_stats(domid_t dom_id, mcd_va_t buf, uint32_t len, bool_t use_l
         int i;
 
         off += mcdc_shared_header(buf, off, len-off);
-        mspin_lock(&g_mcd_shared_hash_lock);
 #ifdef MCD_LINEAR_PROBE
+        mspin_lock(&g_mcd_shared_hash_lock);
         list_for_each_entry(curr, &g_mcd_shared_hash_list, hash_list) {
             off += mcdc_hashT_display(curr, buf, off, len-off);
         }
+        mspin_unlock(&g_mcd_shared_hash_lock);
 #elif defined(MCD_HASH_CHAINING)
         for(i = 0; i < MAX_LIST_HEAD; i++) {
             struct list_head *hash_list = &g_mcd_shared_hash_list[i];
+
+            mspin_lock(&g_mcd_shared_hash_lock[i]);
             list_for_each_entry(curr, hash_list, hash_list) {
                 off += mcdc_hashT_display(curr, buf, off, len-off);
             }
+            mspin_unlock(&g_mcd_shared_hash_lock[i]);
         }
 #endif
-        mspin_unlock(&g_mcd_shared_hash_lock);
     }
 
     return -ERR_NO;
@@ -2573,6 +2674,7 @@ LOCAL int set_memsize(int memsize, mcd_va_t buf, uint32_t len)
     max_mem_bytes = ((uint64_t)memsize) * 1000000ULL;
     if ( max_mem_bytes != 0 && TOT_USED_BYTES() > max_mem_bytes ) {
         if ( cache_mode == MCD_CACHE_MODE_SHARED ) {
+printk("set_memsize = %lu\n", (TOT_USED_BYTES() - max_mem_bytes));
             rc = shared_cache_free(TOT_USED_BYTES() - max_mem_bytes);
         } else {
             rc = partition_cache_free(TOT_USED_BYTES() - max_mem_bytes, 0);
@@ -2708,6 +2810,8 @@ LOCAL int set_param(uint32_t which, uint32_t mode, uint32_t param, mcd_va_t buf,
     uint32_t alpha = 0;
     uint32_t beta = 0;
 
+    int ret = -ERR_NO;
+
     switch ( which ) {
     case 0: // memory
         str = "memory";
@@ -2740,15 +2844,19 @@ LOCAL int set_param(uint32_t which, uint32_t mode, uint32_t param, mcd_va_t buf,
         beta = sd.ssd.beta;
         break;
     case 2:
-        // do nothing
+        reset_time = param; // sec
         break;
-    case 25:
+    case 25: // x
         switch ( param ) {
         case 1:
+            mcd_dom_params_reset();
             (cache_mode == MCD_CACHE_MODE_SHARED) ? s_mcd_flush_all() : p_mcd_flush_all();
             break;
         case 2:
 	    mcdctl_user_enabled = (mcdctl_user_enabled) ? 0:1;
+	    break;
+        case 3:
+            ret = increase_shared_page(1);
 	    break;
         default:
             break;
@@ -2761,7 +2869,7 @@ LOCAL int set_param(uint32_t which, uint32_t mode, uint32_t param, mcd_va_t buf,
     n += scnprintf(info, BSIZE, "Params is set to (mem (%u, %u), ssd (%u, %u))", sd.mem.alpha, sd.mem.beta, sd.ssd.alpha, sd.ssd.beta);
     mcd_copy_to_guest_buf_offset(buf, 0, info, n);
 
-    return -ERR_NO;
+    return ret;
 }
 
 LOCAL long mcd_display(XEN_GUEST_HANDLE(mcd_display_stats_t) arg)
@@ -2812,16 +2920,17 @@ LOCAL long mcd_cache_mode(XEN_GUEST_HANDLE(mcd_cache_mode_t) arg)
     return -ERR_NO;
 }
 
-LOCAL long mcd_param(XEN_GUEST_HANDLE(mcd_param_t) arg)
+LOCAL int mcd_param(XEN_GUEST_HANDLE(mcd_param_t) arg)
 {
     mcd_param_t param;
+    int ret = -ERR_NO;
 
     if( copy_from_guest(&param, arg, 1) ) 
         return -ERR_XENFAULT;
 
-    set_param(param.which, param.mode, param.param, param.buf, param.buf_len);
+    ret = set_param(param.which, param.mode, param.param, param.buf, param.buf_len);
 
-    return -ERR_NO;
+    return ret;
 }
 
 // fn = get, put, remove, check
@@ -3016,19 +3125,29 @@ EXPORT long do_mcd_op(unsigned long cmd, XEN_GUEST_HANDLE(void) arg)
         dom_usage_update_all();
 
         break;
+    case XENMCD_cache_check:
     case XENMCD_cache_get:
+
+#define NSEC_TO_SEC(_nsec)      ((_nsec) / 1000000000ULL)
+        /*
+        if ( NSEC_TO_SEC(NOW() - mcd_dom->reset) > reset_time ) {
+            mcd_dom->reset = NOW();
+            RESET_HITRATE(mcd_dom);
+        }
+        */
+
         switch ( rc ) {
         case RET_GET_MEM:
+        case RET_GET_SSD: // TODO
             HIT(mcd_dom);
             break;
-        case RET_GET_SSD: // TODO
         case -ERR_NO:
+        default:
             MISS(mcd_dom);
             break;
         }
-        SET_HITRATE(mcd_dom);
+        SET_HITRATE(mcd_dom); // missrate = 100 - hitrate;
         break;
-    case XENMCD_cache_check:
     case XENMCD_cache_getsize:
     case XENMCD_display_stats:
     case XENMCD_hypercall_test:
@@ -3081,6 +3200,8 @@ EXPORT int mcd_domain_create(domid_t domid)
     mcd_dom->nr_avail = 0;
     mcd_dom->nr_used_pages = 0;
     mcd_dom->nr_used_bytes = 0;
+    mcd_dom->nr_keys = 0;
+    mcd_dom->rec_cost_avg = 0;
 
     if ( domid > 0 ) {
         mcd_dom->weight = DOM_WEIGHT_DEFAULT;
@@ -3091,6 +3212,7 @@ EXPORT int mcd_domain_create(domid_t domid)
 
     //printk("total_weight = %d\n", total_weight);
 
+    mcd_dom->reset = NOW();
     mcd_dom->get_succ = 1;
     mcd_dom->get_fail = 1;
     mcd_dom->hitrate = 0;
@@ -3215,17 +3337,18 @@ LOCAL int __init mcd_start(void)
 
     #ifdef MCD_LINEAR_PROBE
     INIT_LIST_HEAD(&g_mcd_shared_hash_list);
+    mspin_lock_init(&g_mcd_shared_hash_lock);
     #elif defined(MCD_HASH_CHAINING)
     {
         int i;
         for(i = 0; i < MAX_LIST_HEAD; i++) {
             INIT_LIST_HEAD(&g_mcd_shared_hash_list[i]);
+            mspin_lock_init(&g_mcd_shared_hash_lock[i]);
         }
     }
     #endif
 
     mspin_lock_init(&mcd_data.lock);
-    mspin_lock_init(&g_mcd_shared_hash_lock);
     mspin_lock_init(&g_mcd_domain_list_lock);
 
     mcdctl_start();
