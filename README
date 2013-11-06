@@ -45,6 +45,17 @@ basic running refers to https://github.com/jinho10/mortar.
 external cache driver
 xen-4.1.2/tools/mcd/mcd <directory>
 
+Commands
+--------
+sudo xl <commands>
+
+<commands>
+ mcd                 List mcd status
+ mcd-size            Set mcd maximum memory size in MB
+ mcd-weight          Set dom weight
+ mcd-cache-mode      Set cache mode
+ mcd-param           Set SSD Param
+
 Paper
 -----
 TBD
