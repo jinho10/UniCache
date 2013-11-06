@@ -207,9 +207,10 @@ struct mcd_event_domain
     /* ring lock */
     spinlock_t ring_lock;
     /* shared page */
-    /*int num_shared_page;*/
-    /*mcd_event_shared_page_t* shared_page[];*/
-    mcd_event_shared_page_t *shared_page;
+#define MAX_SHARED_PAGES    1280
+    int num_shared_page;
+    mcd_event_shared_page_t* shared_page[MAX_SHARED_PAGES];
+    /*mcd_event_shared_page_t *shared_page;*/
     /* shared ring page */
     void *ring_page;
     /* front-end ring */
